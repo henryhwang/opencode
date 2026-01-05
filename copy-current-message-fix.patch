@@ -1,0 +1,372 @@
+From dbeac474d1d1e49b2734fe184e906899182462d8 Mon Sep 17 00:00:00 2001
+From: Henry <henry@example.com>
+Date: Sat, 3 Jan 2026 18:23:38 +0800
+Subject: [PATCH] fix: improve copy current message feature to work with both
+ user and assistant messages
+
+- Enhanced getCurrentMessage function to properly detect both user and assistant messages in viewport
+- Improved detection logic with multi-layer approach:
+  * Direct ID matching for user messages
+  * Part-based matching for assistant messages (text-{partId} patterns)
+  * Proximity-based detection as fallback
+  * Most recent message as last resort
+- Enhanced copyMessageContent function with better content type handling:
+  * Prioritizes non-synthetic text content
+  * Falls back to synthetic content for assistant messages
+  * Supports tool output and reasoning content
+  * Provides appropriate user feedback for each case
+- Fixes issue where Ctrl+Y only worked for user messages and showed 'no message currently visible' for assistant messages
+---
+ .../opencode/src/cli/cmd/tui/vim/clipboard.ts | 180 ++++++++++++++----
+ .../src/cli/cmd/tui/vim/navigation.ts         | 115 ++++++-----
+ 2 files changed, 210 insertions(+), 85 deletions(-)
+
+diff --git a/packages/opencode/src/cli/cmd/tui/vim/clipboard.ts b/packages/opencode/src/cli/cmd/tui/vim/clipboard.ts
+index b0d438a35..574fdbe4c 100644
+--- a/packages/opencode/src/cli/cmd/tui/vim/clipboard.ts
++++ b/packages/opencode/src/cli/cmd/tui/vim/clipboard.ts
+@@ -18,56 +18,154 @@ export const copyMessageContent = async (
+   renderer: Renderer
+ ) => {
+   if (!message) {
+-    toast.show({ 
+-      message: "No message to copy", 
+-      variant: "error" 
++    toast.show({
++      message: "No message to copy",
++      variant: "error"
+     })
+     return
+   }
+ 
+   const parts = syncData.part[message.id] ?? []
+-  const textParts = parts.filter((part) => part.type === "text" && !part.synthetic)
+-  
+-  if (textParts.length === 0) {
+-    toast.show({ 
+-      message: "No text content found in message", 
+-      variant: "error" 
+-    })
+-    return
++
++  // First, try to get non-synthetic text content (preferred)
++  const nonSyntheticTextParts = parts.filter((part) => part.type === "text" && !part.synthetic)
++  if (nonSyntheticTextParts.length > 0) {
++    const text = nonSyntheticTextParts
++      .map((part) => part.text)
++      .join("\n")
++      .trim()
++
++    if (text) {
++      try {
++        // Copy to clipboard using existing clipboard functionality
++        const base64 = Buffer.from(text).toString("base64")
++        const osc52 = `\x1b]52;c;${base64}\x07`
++        const finalOsc52 = process.env["TMUX"] ? `\x1bPtmux;\x1b${osc52}\x1b\\` : osc52
++        // @ts-expect-error writeOut is not in type definitions
++        renderer.writeOut(finalOsc52)
++
++        await Clipboard.copy(text)
++        toast.show({
++          message: "Message copied to clipboard!",
++          variant: "success"
++        })
++        return
++      } catch (error) {
++        toast.show({
++          message: "Failed to copy message",
++          variant: "error"
++        })
++        console.error("Error copying message:", error)
++        return
++      }
++    }
+   }
+ 
+-  // Extract and combine text content
+-  const text = textParts
+-    .map((part) => part.text)
+-    .join("\n")
+-    .trim()
++  // If no non-synthetic content found, try synthetic content as fallback
++  // (Assistant messages often have synthetic text parts by design)
++  const syntheticTextParts = parts.filter((part) => part.type === "text" && part.synthetic)
++  if (syntheticTextParts.length > 0) {
++    const text = syntheticTextParts
++      .map((part) => part.text)
++      .join("\n")
++      .trim()
+ 
+-  if (!text) {
+-    toast.show({ 
+-      message: "No text content found in message", 
+-      variant: "error" 
+-    })
+-    return
++    if (text) {
++      try {
++        // Copy to clipboard using existing clipboard functionality
++        const base64 = Buffer.from(text).toString("base64")
++        const osc52 = `\x1b]52;c;${base64}\x07`
++        const finalOsc52 = process.env["TMUX"] ? `\x1bPtmux;\x1b${osc52}\x1b\\` : osc52
++        // @ts-expect-error writeOut is not in type definitions
++        renderer.writeOut(finalOsc52)
++
++        await Clipboard.copy(text)
++        toast.show({
++          message: "Message copied to clipboard (synthetic content)!",
++          variant: "success"
++        })
++        return
++      } catch (error) {
++        toast.show({
++          message: "Failed to copy message",
++          variant: "error"
++        })
++        console.error("Error copying message:", error)
++        return
++      }
++    }
+   }
+ 
+-  try {
+-    // Copy to clipboard using existing clipboard functionality
+-    const base64 = Buffer.from(text).toString("base64")
+-    const osc52 = `\x1b]52;c;${base64}\x07`
+-    const finalOsc52 = process.env["TMUX"] ? `\x1bPtmux;\x1b${osc52}\x1b\\` : osc52
+-    // @ts-expect-error writeOut is not in type definitions
+-    renderer.writeOut(finalOsc52)
+-    
+-    await Clipboard.copy(text)
+-    toast.show({ 
+-      message: "Message copied to clipboard!", 
+-      variant: "success" 
+-    })
+-  } catch (error) {
+-    toast.show({ 
+-      message: "Failed to copy message", 
+-      variant: "error" 
+-    })
+-    console.error("Error copying message:", error)
++  // If no text content, try to get other types of content
++  // Try tool output
++  const toolParts = parts.filter((part) => part.type === "tool" && part.state?.output)
++  if (toolParts.length > 0) {
++    const toolOutput = toolParts
++      .map((part) => part.state.output)
++      .join("\n---\n")  // Separate multiple tool outputs
++      .trim()
++
++    if (toolOutput) {
++      try {
++        const base64 = Buffer.from(toolOutput).toString("base64")
++        const osc52 = `\x1b]52;c;${base64}\x07`
++        const finalOsc52 = process.env["TMUX"] ? `\x1bPtmux;\x1b${osc52}\x1b\\` : osc52
++        // @ts-expect-error writeOut is not in type definitions
++        renderer.writeOut(finalOsc52)
++
++        await Clipboard.copy(toolOutput)
++        toast.show({
++          message: "Tool output copied to clipboard!",
++          variant: "success"
++        })
++        return
++      } catch (error) {
++        toast.show({
++          message: "Failed to copy tool output",
++          variant: "error"
++        })
++        console.error("Error copying tool output:", error)
++        return
++      }
++    }
++  }
++
++  // Try reasoning content
++  const reasoningParts = parts.filter((part) => part.type === "reasoning")
++  if (reasoningParts.length > 0) {
++    const reasoningText = reasoningParts
++      .map((part) => part.text)
++      .join("\n")
++      .trim()
++
++    if (reasoningText) {
++      try {
++        const base64 = Buffer.from(reasoningText).toString("base64")
++        const osc52 = `\x1b]52;c;${base64}\x07`
++        const finalOsc52 = process.env["TMUX"] ? `\x1bPtmux;\x1b${osc52}\x1b\\` : osc52
++        // @ts-expect-error writeOut is not in type definitions
++        renderer.writeOut(finalOsc52)
++
++        await Clipboard.copy(reasoningText)
++        toast.show({
++          message: "Reasoning content copied to clipboard!",
++          variant: "success"
++        })
++        return
++      } catch (error) {
++        toast.show({
++          message: "Failed to copy reasoning content",
++          variant: "error"
++        })
++        console.error("Error copying reasoning content:", error)
++        return
++      }
++    }
+   }
++
++  // If no copyable content found
++  toast.show({
++    message: "No copyable content found in message",
++    variant: "error"
++  })
+ }
+\ No newline at end of file
+diff --git a/packages/opencode/src/cli/cmd/tui/vim/navigation.ts b/packages/opencode/src/cli/cmd/tui/vim/navigation.ts
+index 749c2279b..ff5c3e309 100644
+--- a/packages/opencode/src/cli/cmd/tui/vim/navigation.ts
++++ b/packages/opencode/src/cli/cmd/tui/vim/navigation.ts
+@@ -24,68 +24,95 @@ export const getCurrentMessage = (
+   scroll: ScrollBoxRenderable,
+   messages: () => (AssistantMessage | UserMessage)[],
+   syncData: SyncData,
+-  sessionID: string
++  sessionID: string,
+ ) => {
+   const children = scroll.getChildren()
+   const messagesList = messages()
+   const scrollTop = scroll.y
+   const viewportHeight = scroll.height
+-
+-  // Calculate center of viewport
++  const scrollBottom = scrollTop + viewportHeight
+   const viewportCenter = scrollTop + viewportHeight / 2
+ 
+-  // Create a map for O(1) lookup of message parts
+-  const messagePartsMap = new Map<string, Part[]>()
+-  for (const messageId in syncData.part) {
+-    messagePartsMap.set(messageId, syncData.part[messageId])
++  // Find all elements that are visible in the viewport
++  const visibleElements = children
++    .filter((c: any) => {
++      // Check if element is visible in the viewport (partially or fully)
++      const elementTop = c.y
++      const elementBottom = c.y + (c.height || 0)
++      const isVisible = elementTop < scrollBottom && elementBottom > scrollTop
++
++      return isVisible && c.id
++    })
++    .sort((a: any, b: any) => a.y - b.y)
++
++  // If we have visible elements, try to match them to messages
++  if (visibleElements.length > 0) {
++    // First, try to find elements with IDs that directly match message IDs (user messages)
++    for (const element of visibleElements) {
++      const matchingMessage = messagesList.find((m) => m.id === element.id)
++      if (matchingMessage) {
++        return matchingMessage
++      }
++    }
++
++    // Second, try to find elements with IDs that contain message IDs (assistant message parts)
++    for (const element of visibleElements) {
++      // Check if the element ID contains a message ID (e.g., "text-{partId}" where part belongs to a message)
++      for (const message of messagesList) {
++        // For assistant messages, check if any of their parts match the element ID pattern
++        const parts = syncData.part[message.id] || []
++        const partMatch = parts.find((part) => element.id === `text-${part.id}`)
++        if (partMatch) {
++          return message
++        }
++
++        // Special case: if element ID starts with message ID (might be a container)
++        if (element.id && element.id.startsWith(message.id)) {
++          return message
++        }
++      }
++    }
+   }
+ 
+-  // Get visible messages sorted by position
+-  const visibleMessages = children
+-    .filter((c) => {
+-      if (!c.id) return false
+-      const message = messagesList.find((m) => m.id === c.id)
+-      if (!message) return false
++  // Fallback: Find any message element that is closest to the viewport center
++  if (children.length > 0 && messagesList.length > 0) {
++    let closestMessage: AssistantMessage | UserMessage | null = null
++    let minDistance = Infinity
+ 
+-      // Check if message has valid content using the map
+-      const parts = messagePartsMap.get(message.id)
+-      if (!parts || !Array.isArray(parts)) return false
++    for (const message of messagesList) {
++      // Find all elements that belong to this message
++      const messageElements = children.filter((c: any) => {
++        if (!c.id) return false
+ 
+-      return parts.some((part) => part && part.type === "text" && !part.synthetic && !part.ignored)
+-    })
+-    .sort((a, b) => a.y - b.y)
++        // Direct match (user messages)
++        if (c.id === message.id) return true
+ 
+-  if (visibleMessages.length === 0) {
+-    // If no messages with text content are found, return the closest message regardless of content
+-    if (children.length === 0) return null
++        // Part match (assistant messages)
++        const parts = syncData.part[message.id] || []
++        return parts.some((part: any) => c.id === `text-${part.id}`)
++      })
+ 
+-    let closestChild = children[0]
+-    let minDistance = Math.abs(children[0].y - viewportCenter)
++      // Calculate average position of all elements belonging to this message
++      if (messageElements.length > 0) {
++        const avgY = messageElements.reduce((sum: number, el: any) => sum + el.y, 0) / messageElements.length
++        const distance = Math.abs(avgY - viewportCenter)
+ 
+-    for (const child of children) {
+-      if (!child.id) continue
+-      const distance = Math.abs(child.y - viewportCenter)
+-      if (distance < minDistance) {
+-        minDistance = distance
+-        closestChild = child
++        if (distance < minDistance) {
++          minDistance = distance
++          closestMessage = message
++        }
+       }
+     }
+ 
+-    return messagesList.find(m => m.id === closestChild.id)
++    if (closestMessage) {
++      return closestMessage
++    }
+   }
+ 
+-  // Find message closest to viewport center
+-  let closestMessage = visibleMessages[0]
+-  let minDistance = Math.abs(visibleMessages[0].y - viewportCenter)
+-
+-  for (const message of visibleMessages) {
+-    const distance = Math.abs(message.y - viewportCenter)
+-    if (distance < minDistance) {
+-      minDistance = distance
+-      closestMessage = message
+-    }
++  // Last resort: return the most recent message
++  if (messagesList.length > 0) {
++    return messagesList[messagesList.length - 1]
+   }
+ 
+-  // Return the actual message object from sync.data
+-  return messagesList.find(m => m.id === closestMessage.id)
+-}
+\ No newline at end of file
++  return null
++}
+-- 
+2.51.0
+
