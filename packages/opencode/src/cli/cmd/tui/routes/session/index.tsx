@@ -78,6 +78,8 @@ import { QuestionPrompt } from "./question"
 import { DialogExportOptions } from "../../ui/dialog-export-options"
 import { formatTranscript } from "../../util/transcript"
 import { UI } from "@/cli/ui.ts"
+import { getCurrentMessage } from "@tui/vim/navigation"
+import { copyMessageContent } from "@tui/vim/clipboard"
 
 addDefaultParsers(parsers.parsers)
 
@@ -768,6 +770,24 @@ export function Session() {
         Clipboard.copy(text)
           .then(() => toast.show({ message: "Message copied to clipboard!", variant: "success" }))
           .catch(() => toast.show({ message: "Failed to copy to clipboard", variant: "error" }))
+        dialog.clear()
+      },
+    },
+    {
+      title: "Copy current message",
+      value: "messages.copy.current",
+      keybind: "messages_copy_current",
+      category: "Session",
+      onSelect: (dialog) => {
+        const currentMessage = getCurrentMessage(scroll, () => messages(), sync.data, route.sessionID)
+        if (currentMessage) {
+          copyMessageContent(currentMessage, sync.data, toast, renderer)
+        } else {
+          toast.show({
+            message: "No message currently visible",
+            variant: "warning"
+          })
+        }
         dialog.clear()
       },
     },
